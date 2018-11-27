@@ -22,6 +22,8 @@ class DNSMonitorJSONEncoder(json.JSONEncoder):
             l = list(obj)
             l.sort()
             return l
+        elif isinstance(obj, SortedList):
+            return list(obj)
         elif isinstance(obj, set):
             l = list(obj)
             l.sort()
