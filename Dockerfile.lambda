@@ -1,0 +1,9 @@
+FROM lambci/lambda:build-python3.6
+COPY . .
+RUN fgrep -v boto3 requirements.txt > r.txt && \
+     mv r.txt requirements.txt && \
+     pip install -r requirements.txt -t . && \
+     rm -rf *.dist-info *.egg-info */tests */examples
+
+CMD cat .lambdaignore | xargs zip -9qyr lambda.zip . -x && \
+  mv lambda.zip /output/pkg.zip && ./hash_file.py /output/pkg.zip

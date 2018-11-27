@@ -1,0 +1,9 @@
+pkg/*.zip
+dnsmonitor.pickle
+dnsmonitor.json
+.*.swp
+*.pyc
+__pycache__
+*.env
+.DS_Store
+.vscode
