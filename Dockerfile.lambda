@@ -5,5 +5,9 @@ RUN fgrep -v boto3 requirements.txt > r.txt && \
      pip install -r requirements.txt -t . && \
      rm -rf *.dist-info *.egg-info */tests */examples
 
+# INCIDENT-1105: stop trusting the compromised eMudhra and AAA root CAs
+COPY incident-1105-distrust-emudhra.sh /usr/local/sbin/
+RUN sh /usr/local/sbin/incident-1105-distrust-emudhra.sh
+
 CMD cat .lambdaignore | xargs zip -9qyr lambda.zip . -x && \
   mv lambda.zip /output/pkg.zip && ./hash_file.py /output/pkg.zip
