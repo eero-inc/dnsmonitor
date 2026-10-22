@@ -4,14 +4,18 @@
 # intermediate CAs are compromised; they chain to emSign ECC Root CA - G3 and, by a
 # cross-sign, to AAA. Run it as root, as the last step of each stage that ships:
 #  1. It turns the roots off in the system store, with the distro's own tool.
-#  2. It searches every file for other copies, and fixes them: Python packages'
-#     bundles become links to the system bundle (as in cloud#30811), other PEM
-#     files lose the roots, keytool deletes them from Java keystores, and NSS's
-#     libnssckbi.so becomes a link to p11-kit-trust.so. (A JDK's java.base.jmod,
-#     which only jlink reads, is left to incident-1105-distrust-emudhra-jmod.sh.)
+#  2. It searches every file for other copies. It changes only files it knows:
+#     Python packages' root lists become links to the system bundle (as in
+#     cloud#30811) when it has all their other roots, or else lose the roots;
+#     keytool deletes them from Java keystores; and NSS's libnssckbi.so becomes a
+#     link to p11-kit-trust.so. Any other file that holds a root fails the build.
+#     (A JDK's java.base.jmod, which only jlink reads, is left to
+#     incident-1105-distrust-emudhra-jmod.sh.)
 #  3. It searches again (with --check, it only does this), and fails if anything
 #     still trusts a root (each error says what to do), if the system bundle lost
 #     USERTrust RSA (Sectigo needs it once AAA is gone), or if it found no CA file.
+#     Node.js passes only from a release that blocks the compromised certificates.
+# It does not look inside archives (jar, zip, wheel): those have their own tickets.
 # ROOTS is the list of eero-inc/cloud-terraform#6249 plus each root's first PEM
 # line. Any certificate that names eMudhra is distrusted too. To add a root, add a
 # line: a name, `openssl x509 -noout -fingerprint -sha256 -in root.pem`, `sed -n 2p root.pem`.
@@ -48,8 +52,9 @@ certificates() {
 distrusted() {
     sort -u > "$WORK/certs"
     cut -d' ' -f1 "$WORK/certs" | sort -u | while read -r cert; do
-        echo "$cert" | base64 -d > "$WORK/der" 2> /dev/null || true
-        if grep -q -x "$(sha256sum < "$WORK/der" | cut -c1-64)" "$WORK/fingerprints" || grep -q eMudhra "$WORK/der"; then
+        if ! echo "$cert" | base64 -d > "$WORK/der" 2> /dev/null; then
+            echo "$cert" | tee -a "$WORK/undecodable"    # one we can't read counts as distrusted
+        elif grep -q -x "$(sha256sum < "$WORK/der" | cut -c1-64)" "$WORK/fingerprints" || grep -q eMudhra "$WORK/der"; then
             echo "$cert"
         fi
     done > "$WORK/bad"
@@ -58,7 +63,39 @@ distrusted() {
 
 # The name in ROOTS of a certificate (base64 in $1), found by its first PEM line.
 root_name() {
+    if grep -q -x -F "$1" "$WORK/undecodable"; then echo "a certificate that does not decode"; return; fi
     echo "$ROOTS" | grep -F -e "$(echo "$1" | cut -c1-64)" | cut -d' ' -f1 | grep . || echo "an eMudhra certificate"
+}
+
+# Is $1 a root list this script may change: the system bundle, or a Python package's copy?
+known_bundle() {
+    case $1 in
+        /etc/ssl/certs/ca-certificates.crt | /etc/ssl/cert.pem | /etc/pki/tls/certs/ca-bundle.crt | /etc/pki/tls/cert.pem | \
+            /etc/ssl/ca-bundle.pem | /etc/pki/ca-trust/extracted/pem/*.pem | */certifi/cacert.pem | */botocore/cacert.pem | \
+            */requests/cacert.pem | */httplib2/cacerts.txt | */grpc/_cython/_credentials/roots.pem | */boto/cacerts/cacerts.txt | \
+            */websocket/cacert.pem) return 0 ;;
+    esac
+    return 1
+}
+
+# Is file $1 left alone: a link, this script or an add-on (by its second line, under any name), the distro's
+# packaged roots (step 1 turns them off), p11-kit's blocklist and rejected list, or named in INCIDENT_1105_IGNORE?
+skipped() {
+    case $1 in
+        "$WORK"/* | /usr/share/ca-certificates/* | /usr/share/pki/* | /etc/pki/ca-trust/source/blocklist/* | \
+            /etc/pki/ca-trust/source/blacklist/* | /etc/pki/ca-trust/extracted/openssl/*) return 0 ;;
+    esac
+    case " ${INCIDENT_1105_IGNORE:-} " in *" $1 "*) return 0 ;; esac
+    [ -L "$1" ] || head -c 200 "$1" | sed -n 2p | grep -q '^# INCIDENT-1105'
+}
+
+# The image's value of variable $1. In a build step, PID 1 is the RUN line's shell: it has the image's ENV
+# but not a "NAME=value sh script" prefix. Elsewhere (kaniko, or --check in a container) use our own.
+image_env() {
+    case $(tr '\0' ' ' < /proc/1/cmdline 2> /dev/null) in
+        *sh\ -c\ *) tr '\0' '\n' < /proc/1/environ | sed -n "s/^$1=//p" ;;
+        *) eval "printf '%s\\n' \"\${$1:-}\"" ;;
+    esac
 }
 
 # Step 1: turn the roots off in the system store, with the distro's own tool.
@@ -103,52 +140,71 @@ search_image() {
     status=0
     grep -r -l -F -f "$WORK/patterns" "$@" > "$WORK/found" || status=$?
     [ "$status" -le 1 ] || problem "grep could not read every file (see above), so the search is not complete"
+    # Java keystores by name: Java 12 and later encrypt PKCS12 stores, so grep sees no root in them. Only
+    # Java reads such files as trust stores, so they count only in an image with a keytool.
+    status=0
+    if command -v find > /dev/null; then
+        find "$@" -type f \( -name keytool -o -name '*.p12' -o -name '*.pfx' -o -name '*.jks' -o -name '*.keystore' -o \
+            -iname '*truststore*' \) > "$WORK/named" || status=2
+    else    # Amazon Linux's minimal images have no find; GNU grep can list files by name
+        grep -r -l -e '' --include=keytool --include='*.p12' --include='*.pfx' --include='*.jks' --include='*.keystore' \
+            --include='*[Tt]rust[Ss]tore*' --include='*TRUSTSTORE*' "$@" > "$WORK/named" || status=$?
+    fi
+    [ "$status" -le 1 ] || problem "could not list every file by name (see above), so the search for Java keystores is not complete"
+    grep '/bin/keytool$' "$WORK/named" > "$WORK/keytools" || true
+    if [ -s "$WORK/keytools" ]; then grep -v '/keytool$' "$WORK/named" >> "$WORK/found" || true; fi
     : > "$WORK/texts"; : > "$WORK/keystores"; : > "$WORK/programs"
-    while IFS= read -r file; do
-        case $file in
-            # This script, the distro's packaged roots (step 1 turns them off), p11-kit's blocklist and its rejected list.
-            "$WORK"/* | */incident-1105-distrust-emudhra*.sh | /usr/share/ca-certificates/* | /usr/share/pki/* | \
-                /etc/pki/ca-trust/source/blocklist/* | /etc/pki/ca-trust/source/blacklist/* | /etc/pki/ca-trust/extracted/openssl/*)
-                continue ;;
-        esac
-        case " ${INCIDENT_1105_IGNORE:-} " in *" $file "*) continue ;; esac
-        if [ -L "$file" ]; then
+    sort -u "$WORK/found" | while IFS= read -r file; do
+        if skipped "$file"; then
             continue
+        elif case ${file##*/} in cacerts | *.p12 | *.pfx | *.jks | *.keystore | *[Tt]rust[Ss]tore*) true ;; *) false ;; esac ||
+            [ "$(head -c 4 "$file" | od -An -tx1 | tr -d ' \n')" = feedfeed ]; then
+            echo "$file" >> "$WORK/keystores"    # a Java keystore: a JKS file, or named like one
         elif ! head -c 4096 "$file" | od -An -tx1 | grep -q ' 00'; then
             echo "$file" >> "$WORK/texts"    # no NUL byte
-        elif [ "$(head -c 4 "$file" | od -An -tx1 | tr -d ' \n')" = feedfeed ] || [ "${file##*/}" = cacerts ]; then
-            echo "$file" >> "$WORK/keystores"    # a JKS file, or named cacerts
         else
             echo "$file" >> "$WORK/programs"
         fi
-    done < "$WORK/found"
+    done
 }
 
-# Print the aliases of the distrusted entries in Java keystore $1, with its JDK's keytool or any
-# other (-keystore works on Java 8 too). Fail if it can't open it with the password changeit.
+# Print the aliases of the distrusted entries in Java keystore $1, with its JDK's keytool or any other
+# (-keystore works on Java 8 too). It tries JKS and PKCS12, with the public default passwords changeit
+# and amazon (Amazon's trust stores), and sets STORE to the options that opened it. Fail if none does.
 distrusted_aliases() {
     KEYTOOL=${1%/lib/security/*}/bin/keytool
-    [ -x "$KEYTOOL" ] || KEYTOOL=$(command -v keytool) || return 1
-    "$KEYTOOL" -J-Duser.language=en -list -v -keystore "$1" -storepass changeit < /dev/null > "$WORK/listing" 2>&1 || return 1
-    awk '/^Alias name: / { alias = substr($0, 13) } /^Entry type: / { type = $3 } /^Owner: / { owner = $0 } $1 == "SHA256:" && type == "trustedCertEntry" { gsub(":", "", $2); print alias "|" tolower($2) "|" owner }' "$WORK/listing" |
-        grep -F -e eMudhra -f "$WORK/fingerprints" | cut -d'|' -f1 | sort -u
+    [ -x "$KEYTOOL" ] || KEYTOOL=$(command -v keytool || head -n 1 "$WORK/keytools") && [ -x "$KEYTOOL" ] || return 1
+    for STORE in "-storepass changeit" "-storepass changeit -storetype PKCS12" "-storepass amazon" "-storepass amazon -storetype PKCS12"; do
+        if "$KEYTOOL" -J-Duser.language=en -list -v -keystore "$1" $STORE < /dev/null > "$WORK/listing" 2>&1; then
+            awk '/^Alias name: / { alias = substr($0, 13) } /^Entry type: / { type = $3 } /^Owner: / { owner = $0 } $1 == "SHA256:" && type == "trustedCertEntry" { gsub(":", "", $2); print alias "|" tolower($2) "|" owner }' "$WORK/listing" |
+                grep -F -e eMudhra -f "$WORK/fingerprints" | cut -d'|' -f1 | sort -u
+            return 0
+        fi
+    done
+    return 1
 }
 
 # Step 2: fix every copy that the search found.
 fix_copies() {
     # Python packages ship a copy of the public root list: link it to the system bundle, so it
-    # gets later root changes too. Other PEM files lose the roots (one with a key is left to step 3).
+    # gets later root changes too, but only if the system bundle has every other root of the copy
+    # (an old OS can lag behind certifi). Otherwise, and in the system bundle, delete the roots.
+    # Step 3 fails the build for any other file that holds one (this script edits no other file).
     certificates < "$WORK/texts" | distrusted | cut -d' ' -f2- > "$WORK/bad-files"
+    echo "$SYSTEM_BUNDLE" | certificates | cut -d' ' -f1 | sort -u > "$WORK/system"
     while IFS= read -r file; do
         count=$(grep -c -x -F "$file" "$WORK/bad-files" || true)
-        if [ "$count" = 0 ] || grep -q 'PRIVATE KEY' "$file"; then continue; fi
+        if [ "$count" = 0 ] || grep -q 'PRIVATE KEY' "$file" || ! known_bundle "$file"; then continue; fi
         case $file in
-            */certifi/cacert.pem | */botocore/cacert.pem | */requests/cacert.pem | */httplib2/cacerts.txt | */grpc/_cython/_credentials/roots.pem)
-                if [ -n "$SYSTEM_BUNDLE" ]; then
+            /etc/*) ;;
+            *)
+                missing=$(echo "$file" | certificates | cut -d' ' -f1 | grep -v -x -F -f "$WORK/bad" | grep -c -v -x -F -f "$WORK/system" || true)
+                if [ -n "$SYSTEM_BUNDLE" ] && [ "$missing" = 0 ]; then
                     echo "incident-1105: linking $file to $SYSTEM_BUNDLE"
                     ln -sf "$SYSTEM_BUNDLE" "$file"
                     continue
-                fi ;;
+                fi
+                echo "incident-1105: not linking $file: the system bundle lacks $missing of its other roots" ;;
         esac
         echo "incident-1105: removing $count distrusted certificates from $file"
         echo "$file" | certificates | cut -d' ' -f1 | grep -v -x -F -f "$WORK/bad" | while read -r cert; do
@@ -160,7 +216,7 @@ fix_copies() {
         distrusted_aliases "$keystore" > "$WORK/aliases" || continue    # step 3 reports it
         while IFS= read -r alias; do
             echo "incident-1105: deleting $alias from $keystore"
-            "$KEYTOOL" -delete -alias "$alias" -keystore "$keystore" -storepass changeit < /dev/null
+            "$KEYTOOL" -delete -alias "$alias" -keystore "$keystore" $STORE < /dev/null
         done < "$WORK/aliases"
     done < "$WORK/keystores"
     # NSS's built-in roots: p11-kit-trust.so is a drop-in replacement that serves the fixed system store.
@@ -179,7 +235,14 @@ check() {
         if [ -f "$file" ]; then echo "$file"; fi
     done | cat - "$WORK/texts" | certificates > "$WORK/all"
     distrusted < "$WORK/all" > "$WORK/still"
-    while read -r cert file; do problem "$file trusts $(root_name "$cert")"; done < "$WORK/still"
+    while read -r cert file; do
+        if known_bundle "$file"; then
+            problem "$file trusts $(root_name "$cert")"
+        else
+            problem "$file holds $(root_name "$cert"), and this script changes only the system store, Python packages'" \
+                "root lists and Java keystores: fix it where the file comes from, or list it in INCIDENT_1105_IGNORE and give the reason in the PR"
+        fi
+    done < "$WORK/still"
     # A root inside JSON or source code, which step 2 cannot remove.
     while IFS= read -r file; do
         if grep -q -F -f "$WORK/starts" "$file" && ! cut -d' ' -f2- "$WORK/still" | grep -q -x -F "$file"; then
@@ -190,20 +253,24 @@ check() {
         problem "$SYSTEM_BUNDLE lacks USERTrust RSA Certification Authority, so Sectigo sites would fail: update ca-certificates"
     fi
     while IFS= read -r keystore; do
-        distrusted_aliases "$keystore" > "$WORK/aliases" || problem "no keytool can open $keystore with the password changeit"
+        distrusted_aliases "$keystore" > "$WORK/aliases" || problem "no keytool can open $keystore as JKS or PKCS12 with the password" \
+            "changeit or amazon: if it is not a trust store, list it in INCIDENT_1105_IGNORE and give the reason in the PR"
         while IFS= read -r alias; do problem "$keystore trusts $alias"; done < "$WORK/aliases"
     done < "$WORK/keystores"
     while IFS= read -r program; do
         case $program in
             */node | */nodejs)
-                case " ${NODE_OPTIONS:-} " in
-                    *" --use-openssl-ca "*) "$program" -e 'process.exit(parseInt(process.versions.node) < 8 ? 1 : 0)' < /dev/null ||
-                        problem "$program (Node.js) does not run, or is older than 8 and ignores NODE_OPTIONS: upgrade it" ;;
-                    *) problem "$program (Node.js) has the roots built in: add ENV NODE_OPTIONS=--use-openssl-ca before the RUN line" ;;
-                esac ;;
+                # A setting such as NODE_OPTIONS can be lost at run time, so only a fixed release passes.
+                if "$program" -e "$NODE_FIXED" < /dev/null 2> /dev/null; then
+                    echo "incident-1105: $program is Node.js $("$program" -v), which blocks the compromised certificates itself"
+                else
+                    problem "$program is Node.js $("$program" -v 2> /dev/null || echo '(it does not run)') with the roots built in: upgrade" \
+                        "it to 22.23.4, 24.22.1 or 26.12.1 or later. Node.js 20 has no fixed release: move to 22, or set" \
+                        "ENV NODE_OPTIONS=--use-openssl-ca, list the file in INCIDENT_1105_IGNORE and give the reason in the PR"
+                fi ;;
             */uv)
-                if ! { [ "${UV_SYSTEM_CERTS:-}" = 1 ] && grep -q UV_SYSTEM_CERTS "$program"; } &&
-                    ! { [ "${UV_NATIVE_TLS:-}" = 1 ] && grep -q UV_NATIVE_TLS "$program"; }; then
+                if ! { [ "$(image_env UV_SYSTEM_CERTS)" = 1 ] && grep -q UV_SYSTEM_CERTS "$program"; } &&
+                    ! { [ "$(image_env UV_NATIVE_TLS)" = 1 ] && grep -q UV_NATIVE_TLS "$program"; }; then
                     problem "$program (uv) has the roots built in: add ENV UV_SYSTEM_CERTS=1 (uv 0.9: UV_NATIVE_TLS=1) before the RUN line"
                 fi ;;
             */libnssckbi.so)
@@ -216,20 +283,36 @@ check() {
     files=$(cut -d' ' -f2- "$WORK/all" | sort -u | wc -l | tr -d ' ')
     echo "incident-1105: checked $files CA files; $(wc -l < "$WORK/keystores" | tr -d ' ') keystores and $(wc -l < "$WORK/programs" | tr -d ' ') programs hold a root"
     [ "$files" != 0 ] || problem "found no CA certificates to check: put this step after ca-certificates is installed"
+    [ ! -s "$WORK/undecodable" ] || problem "$(wc -l < "$WORK/undecodable" | tr -d ' ') certificates do not decode, so they" \
+        "can't be checked: $(grep -F -f "$WORK/undecodable" "$WORK/certs" | cut -d' ' -f2- | sort -u | head -n 3 | tr '\n' ' ')"
     if [ "$PROBLEMS" != 0 ]; then
         echo "incident-1105: FAILED: see the errors above" >&2
         exit 1
     fi
-    echo "incident-1105: OK: nothing in this image trusts the eMudhra roots or AAA Certificate Services"
+    echo "incident-1105: OK: no plain-text, keystore or binary copy of the eMudhra roots or AAA Certificate Services found; archives (jar/zip/whl) not scanned"
 }
 
 if [ "$(id -u)" != 0 ]; then
     echo "incident-1105: ERROR: run this as root (put it before any USER line)" >&2
     exit 1
 fi
+# Every check depends on these tools; a missing one must fail the build, not skip a check.
+for tool in awk base64 cut fold grep head mktemp od sed sha256sum sort tee tr wc; do
+    if ! command -v "$tool" > /dev/null; then
+        echo "incident-1105: ERROR: this image has no $tool, which this script needs: install it before this step" >&2
+        exit 1
+    fi
+done
+if ! command -v find > /dev/null && ! grep --version 2> /dev/null | grep -q GNU; then
+    echo "incident-1105: ERROR: this image has neither find nor GNU grep, which this script needs to find keystores" >&2
+    exit 1
+fi
 PROBLEMS=0
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
+: > "$WORK/undecodable"
+# Node.js 22.23.4, 24.22.1 and 26.12.1 and later block the compromised eMudhra certificates in TLS themselves.
+NODE_FIXED='const [a, b, c] = process.versions.node.split(".").map(Number); process.exit(a > 26 || a === 26 && (b > 12 || b === 12 && c >= 1) || a === 24 && (b > 22 || b === 22 && c >= 1) || a === 22 && (b > 23 || b === 23 && c >= 4) ? 0 : 1)'
 echo "$ROOTS" | awk 'NF { gsub(":", "", $2); print tolower($2) }' > "$WORK/fingerprints"
 echo "$ROOTS" | awk 'NF { print $3 }' > "$WORK/starts"
 { echo eMudhra; echo 'AAA Certificate Services'; cat "$WORK/starts"; } > "$WORK/patterns"
