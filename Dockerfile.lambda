@@ -7,7 +7,7 @@ RUN fgrep -v boto3 requirements.txt > r.txt && \
 
 # INCIDENT-1105: stop trusting the compromised eMudhra and AAA root CAs
 COPY incident-1105-distrust-emudhra.sh /usr/local/sbin/
-RUN sh /usr/local/sbin/incident-1105-distrust-emudhra.sh
+RUN INCIDENT_1105_IGNORE="/usr/local/aws-cli/v2/2.9.20/dist/aws /usr/local/aws-cli/v2/2.9.20/dist/aws_completer /usr/local/aws-sam-cli/1.72.0/dist/sam" sh /usr/local/sbin/incident-1105-distrust-emudhra.sh
 
 CMD cat .lambdaignore | xargs zip -9qyr lambda.zip . -x && \
   mv lambda.zip /output/pkg.zip && ./hash_file.py /output/pkg.zip
